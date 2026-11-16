@@ -584,15 +584,11 @@ impl<C: HasConnection> X11rbClient<C> {
     ) -> Result<(), ClientError> {
         if msg.format == 32 {
             let [length, atom, ..] = msg.data.as_data32();
-            let reply = self
-                .conn()
-                .get_property(true, msg.window, atom, AtomEnum::ANY, 0, length)?
-                .reply()?;
+            let data = take_message(self.conn(), msg.window, atom, length)?;
             // handle fcitx4 occasionally sending empty reply
-            if reply.value_len == 0 {
+            if data.is_empty() {
                 return Err(ClientError::InvalidReply);
             }
-            let data = reply.value;
             let req = xim_parser::read(&data)?;
             client_handle_request(self, handler, req)?;
         } else if msg.format == 8 {
@@ -686,6 +682,31 @@ impl<C: HasConnection> ClientCore for X11rbClient<C> {
     }
 }
 
+/// Takes the `length` bytes a format 32 `_XIM_PROTOCOL` ClientMessage names off the front of `atom`.
+///
+/// A server appends each message to a property and sends a ClientMessage for it, and IMdkit (ibus,
+/// fcitx4) cycles through 21 property names, so a client more than 21 messages behind finds later
+/// messages appended to this one. Those belong to later ClientMessages and go back for them, as
+/// libX11's `_XimXGetReadData` does. `length` counts bytes where GetProperty counts 4-byte units,
+/// so the whole property is read and the rest put back in front of anything appended since.
+#[cfg(feature = "x11rb-client")]
+fn take_message(
+    conn: &impl Connection,
+    window: Window,
+    atom: Atom,
+    length: u32,
+) -> Result<Vec<u8>, ClientError> {
+    let reply = conn
+        .get_property(true, window, atom, AtomEnum::ANY, 0, u32::MAX)?
+        .reply()?;
+    let mut message = reply.value;
+    let rest = message.split_off((length as usize).min(message.len()));
+    if !rest.is_empty() {
+        conn.change_property8(PropMode::PREPEND, window, atom, reply.type_, &rest)?;
+    }
+    Ok(message)
+}
+
 fn send_req_impl<C: HasConnection, E: From<ConnectionError> + From<ReplyError>>(
     c: &C,
     atoms: &Atoms<Atom>,
@@ -773,5 +794,49 @@ fn deserialize_event_impl(xev: &xim_parser::XEvent) -> KeyPressEvent {
         event_y: xev.event_y,
         state: xev.state.into(),
         same_screen: xev.same_screen,
+    }
+}
+
+#[cfg(all(test, feature = "x11rb-client"))]
+mod tests {
+    use super::*;
+    use std::boxed::Box;
+    use std::error::Error;
+
+    /// ibus appends a reply to one of its 21 property names while the reply before it under that
+    /// name is still unread, then sends one ClientMessage for each.
+    #[test]
+    #[ignore = "needs an X server: run with DISPLAY set and -- --ignored"]
+    fn each_message_in_a_reused_property_goes_to_its_own_client_message(
+    ) -> Result<(), Box<dyn Error>> {
+        let (conn, screen) = RustConnection::connect(None)?;
+        let window = conn.generate_id()?;
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            window,
+            conn.setup().roots[screen].root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            x11rb::COPY_FROM_PARENT,
+            &Default::default(),
+        )?;
+        let atom = conn.intern_atom(false, b"_server0_0")?.reply()?.atom;
+        let first = [1; 44];
+        let second = [2; 44];
+        for message in [first, second] {
+            conn.change_property8(PropMode::APPEND, window, atom, AtomEnum::STRING, &message)?;
+        }
+
+        assert_eq!(take_message(&conn, window, atom, 44)?, first);
+        assert_eq!(take_message(&conn, window, atom, 44)?, second);
+        let left = conn
+            .get_property(false, window, atom, AtomEnum::ANY, 0, u32::MAX)?
+            .reply()?;
+        assert_eq!(left.value_len, 0);
+        Ok(())
     }
 }
