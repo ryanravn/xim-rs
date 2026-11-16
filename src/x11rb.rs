@@ -33,9 +33,9 @@ use x11rb::{
     errors::{ConnectError, ConnectionError, ParseError, ReplyError, ReplyOrIdError},
     protocol::{
         xproto::{
-            Atom, AtomEnum, ClientMessageEvent, ConnectionExt, KeyPressEvent, PropMode, Screen,
-            SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass, CLIENT_MESSAGE_EVENT,
-            SELECTION_NOTIFY_EVENT,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt,
+            KeyPressEvent, PropMode, Screen, SelectionNotifyEvent, SelectionRequestEvent, Window,
+            WindowClass, CLIENT_MESSAGE_EVENT, SELECTION_NOTIFY_EVENT,
         },
         Event,
     },
@@ -404,21 +404,6 @@ impl<C: HasConnection> X11rbClient<C> {
     ) -> Result<Self, ClientError> {
         let conn = has_conn.conn();
         let screen = &conn.setup().roots[screen_num];
-        let client_window = conn.generate_id()?;
-
-        conn.create_window(
-            COPY_DEPTH_FROM_PARENT,
-            client_window,
-            screen.root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_ONLY,
-            screen.root_visual,
-            &Default::default(),
-        )?;
 
         let var = std::env::var("XMODIFIERS").ok();
         let var = var.as_ref().and_then(|n| n.strip_prefix("@im="));
@@ -453,7 +438,29 @@ impl<C: HasConnection> X11rbClient<C> {
                 };
 
                 if let Some(name) = name.strip_prefix("@server=") {
-                    if name == im_name {
+                    // A server that was killed leaves its name in XIM_SERVERS with no owner.
+                    if name == im_name && server_owner != x11rb::NONE {
+                        // Its window going away is how a server's exit is heard before anything
+                        // is sent to it.
+                        conn.change_window_attributes(
+                            server_owner,
+                            &ChangeWindowAttributesAux::new()
+                                .event_mask(EventMask::STRUCTURE_NOTIFY),
+                        )?;
+                        let client_window = conn.generate_id()?;
+                        conn.create_window(
+                            COPY_DEPTH_FROM_PARENT,
+                            client_window,
+                            screen.root,
+                            0,
+                            0,
+                            1,
+                            1,
+                            0,
+                            WindowClass::INPUT_ONLY,
+                            screen.root_visual,
+                            &Default::default(),
+                        )?;
                         conn.convert_selection(
                             client_window,
                             server_atom,
@@ -567,8 +574,14 @@ impl<C: HasConnection> X11rbClient<C> {
                     Ok(false)
                 }
             }
+            Event::DestroyNotify(e) if e.window == self.server_owner_window => {
+                Err(ClientError::NoXimServer)
+            }
+            // Before XIM_XCONNECT is answered there is no IM window, and a BadWindow for window 0
+            // is somebody else's.
             Event::Error(ref err)
                 if err.error_kind == x11rb::protocol::ErrorKind::Window
+                    && self.im_window != x11rb::NONE
                     && err.bad_value == self.im_window =>
             {
                 Err(ClientError::NoXimServer)
@@ -618,6 +631,21 @@ impl<C: HasConnection> X11rbClient<C> {
         self.conn().flush()?;
 
         Ok(())
+    }
+}
+
+/// Without this a client's window lasts as long as the X connection, one more each time a client
+/// connects again.
+#[cfg(feature = "x11rb-client")]
+impl<C: HasConnection> Drop for X11rbClient<C> {
+    fn drop(&mut self) {
+        let destroyed = self
+            .conn()
+            .destroy_window(self.client_window)
+            .and_then(|_| self.conn().flush());
+        if let Err(err) = destroyed {
+            log::warn!("Can't destroy the XIM client window: {}", err);
+        }
     }
 }
 
